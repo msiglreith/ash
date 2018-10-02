@@ -685,7 +685,23 @@ impl FieldExt for vkxml::Field {
 
 pub type CommandMap<'a> = HashMap<vkxml::Identifier, &'a vkxml::Command>;
 
-fn generate_function_pointers(ident: Ident, commands: &[&vkxml::Command]) -> quote::Tokens {
+fn generate_function_pointers<'a>(
+    ident: Ident,
+    commands: &[&'a vkxml::Command],
+    fn_cache: &mut HashSet<&'a str>,
+) -> quote::Tokens {
+    let pfn_commands: Vec<_> = commands
+        .iter()
+        .filter(|cmd| {
+            let ident = cmd.name.as_str();
+            if !fn_cache.contains(ident) {
+                fn_cache.insert(ident);
+                return true;
+            } else {
+                return false;
+            }
+        })
+        .collect();
     let names: Vec<_> = commands.iter().map(|cmd| cmd.command_ident()).collect();
     let names_ref = &names;
     let raw_names: Vec<_> = commands
@@ -740,13 +756,13 @@ fn generate_function_pointers(ident: Ident, commands: &[&vkxml::Command]) -> quo
         .collect();
     let return_types_ref = &return_types;
 
-    let pfn_names: Vec<_> = commands
+    let pfn_names: Vec<_> = pfn_commands
         .iter()
         .map(|cmd| Ident::from(format!("PFN_{}", cmd.name.as_str())))
         .collect();
     let pfn_names_ref = &pfn_names;
 
-    let signature_params: Vec<Vec<_>> = commands
+    let signature_params: Vec<Vec<_>> = pfn_commands
         .iter()
         .map(|cmd| {
             let params: Vec<_> = cmd.param
@@ -762,10 +778,16 @@ fn generate_function_pointers(ident: Ident, commands: &[&vkxml::Command]) -> quo
         .collect();
     let signature_params_ref = &signature_params;
 
+    let pfn_return_types: Vec<_> = pfn_commands
+        .iter()
+        .map(|cmd| cmd.return_type.type_tokens())
+        .collect();
+    let pfn_return_types_ref = &pfn_return_types;
+
     quote!{
         #(
             #[allow(non_camel_case_types)]
-            pub type #pfn_names_ref = extern "system" fn(#(#signature_params_ref),*) -> #return_types_ref;
+            pub type #pfn_names_ref = extern "system" fn(#(#signature_params_ref),*) -> #pfn_return_types_ref;
         )*
 
         pub struct #ident {
@@ -902,10 +924,11 @@ pub fn generate_extension_constants<'a>(
         #(#enum_tokens)*
     }
 }
-pub fn generate_extension_commands(
+pub fn generate_extension_commands<'a>(
     extension_name: &str,
     items: &[vk_parse::ExtensionItem],
-    cmd_map: &CommandMap,
+    cmd_map: &CommandMap<'a>,
+    fn_cache: &mut HashSet<&'a str>,
 ) -> Tokens {
     let commands = items
         .iter()
@@ -922,13 +945,14 @@ pub fn generate_extension_commands(
         .collect_vec();
     let name = format!("{}Fn", extension_name.to_camel_case());
     let ident = Ident::from(&name[2..]);
-    generate_function_pointers(ident, &commands)
+    generate_function_pointers(ident, &commands, fn_cache)
 }
 pub fn generate_extension<'a>(
     extension: &'a vk_parse::Extension,
-    cmd_map: &CommandMap,
+    cmd_map: &CommandMap<'a>,
     const_cache: &mut HashSet<&'a str>,
     const_values: &mut HashMap<Ident, Vec<Ident>>,
+    fn_cache: &mut HashSet<&'a str>,
 ) -> Option<quote::Tokens> {
     // Okay this is a little bit odd. We need to generate all extensions, even disabled ones,
     // because otherwise some StructureTypes won't get generated. But we don't generate extensions
@@ -943,7 +967,7 @@ pub fn generate_extension<'a>(
         const_cache,
         const_values,
     );
-    let fp = generate_extension_commands(&extension.name, &extension.items, cmd_map);
+    let fp = generate_extension_commands(&extension.name, &extension.items, cmd_map, fn_cache);
     let q = quote!{
         #fp
         #extension_tokens
@@ -1453,7 +1477,11 @@ pub fn generate_definition(
         _ => None,
     }
 }
-pub fn generate_feature(feature: &vkxml::Feature, commands: &CommandMap) -> quote::Tokens {
+pub fn generate_feature<'a>(
+    feature: &vkxml::Feature,
+    commands: &CommandMap<'a>,
+    fn_cache: &mut HashSet<&'a str>,
+) -> quote::Tokens {
     let (static_commands, entry_commands, device_commands, instance_commands) = feature
         .elements
         .iter()
@@ -1497,21 +1525,24 @@ pub fn generate_feature(feature: &vkxml::Feature, commands: &CommandMap) -> quot
         );
     let version = feature.version_string();
     let static_fn = if feature.version == 1.0 {
-        generate_function_pointers(Ident::from("StaticFn"), &static_commands)
+        generate_function_pointers(Ident::from("StaticFn"), &static_commands, fn_cache)
     } else {
         quote!{}
     };
     let entry = generate_function_pointers(
         Ident::from(format!("EntryFnV{}", version).as_str()),
         &entry_commands,
+        fn_cache,
     );
     let instance = generate_function_pointers(
         Ident::from(format!("InstanceFnV{}", version).as_str()),
         &instance_commands,
+        fn_cache,
     );
     let device = generate_function_pointers(
         Ident::from(format!("DeviceFnV{}", version).as_str()),
         &device_commands,
+        fn_cache,
     );
     quote! {
         #static_fn
@@ -1689,8 +1720,8 @@ pub fn write_source_code(path: &Path) {
         .flat_map(|constants| constants.elements.iter())
         .collect();
 
+    let mut fn_cache = HashSet::new();
     let mut const_cache = HashSet::new();
-
     let mut const_values: HashMap<Ident, Vec<Ident>> = HashMap::new();
 
     let (enum_code, bitflags_code) = enums
@@ -1710,7 +1741,15 @@ pub fn write_source_code(path: &Path) {
         .collect();
     let extension_code = extensions
         .iter()
-        .filter_map(|ext| generate_extension(ext, &commands, &mut const_cache, &mut const_values))
+        .filter_map(|ext| {
+            generate_extension(
+                ext,
+                &commands,
+                &mut const_cache,
+                &mut const_values,
+                &mut fn_cache,
+            )
+        })
         .collect_vec();
 
     let union_types = definitions
@@ -1728,7 +1767,7 @@ pub fn write_source_code(path: &Path) {
 
     let feature_code: Vec<_> = features
         .iter()
-        .map(|feature| generate_feature(feature, &commands))
+        .map(|feature| generate_feature(feature, &commands, &mut fn_cache))
         .collect();
     let feature_extensions_code =
         generate_feature_extension(&spec2, &mut const_cache, &mut const_values);
